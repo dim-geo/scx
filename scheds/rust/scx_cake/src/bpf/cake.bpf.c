@@ -6,6 +6,8 @@
 #include "intf.h"
 #include "bpf_compat.h"
 
+#define PF_SPECIAL 0x00230030
+
 char _license[] SEC("license") = "GPL";
 
 /* Scheduler RODATA config - JIT constant-folds these for ~200 cycle savings per decision */
@@ -567,7 +569,7 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
  * at the same tier.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static __attribute__((noinline))
-void reclassify_task_cold(struct cake_task_ctx *tctx)
+void reclassify_task_cold(struct cake_task_ctx *tctx,bool is_kthread)
 {
     u32 packed = cake_relaxed_load_u32(&tctx->packed_info);
 
@@ -619,6 +621,9 @@ void reclassify_task_cold(struct cake_task_ctx *tctx)
             else if (new_avg < g1) spot_tier = 1;
             else if (new_avg < g2) spot_tier = 2;
             else                   spot_tier = 3;
+            if (is_kthread){
+                if      (spot_tier > 0) --spot_tier;
+	    }
 
             if (spot_tier != tier) {
                 u32 reset = packed & ~((u32)3 << SHIFT_STABLE);
@@ -679,6 +684,10 @@ void reclassify_task_cold(struct cake_task_ctx *tctx)
     else if (new_avg < g2) new_tier = 2;
     else                   new_tier = 3;
 
+    if (is_kthread){
+        if      (new_tier > 0) --new_tier;
+    }
+
     /* ── WRITE PACKED_INFO (MESI-friendly: skip if unchanged) ── */
     bool tier_changed = (new_tier != old_tier);
 
@@ -714,8 +723,11 @@ void reclassify_task_cold(struct cake_task_ctx *tctx)
 void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 {
     struct cake_task_ctx *tctx = get_task_ctx(p, false);
+    bool is_kthread = p->flags & PF_SPECIAL;
+    if ( !is_kthread && p->nr_cpus_allowed == 1) is_kthread = true;
+    if ( !is_kthread && is_migration_disabled(p)) is_kthread = true;
     if (tctx)
-        reclassify_task_cold(tctx);
+        reclassify_task_cold(tctx,is_kthread);
 }
 
 /* Initialize the scheduler */
